@@ -101,10 +101,17 @@ def _probe_rgb_encoder(
     fps: int,
     encoder_threads: int | None,
 ) -> None:
-    """Open the codec and encode one frame so hardware-only failures happen before recording."""
+    """Open the codec and encode one representative frame before recording.
+
+    A 64x64 probe is accepted by software encoders but is below the minimum
+    NVENC frame size on some NVIDIA driver/FFmpeg combinations.  Probing at
+    the normal top-camera size also catches codec options that only fail for
+    real dimensions.
+    """
     import av
     import numpy as np
 
+    probe_width, probe_height = 640, 480
     with TemporaryDirectory() as tmp_dir:
         container = av.open(str(Path(tmp_dir) / "encoder_probe.mp4"), "w")
         try:
@@ -114,11 +121,13 @@ def _probe_rgb_encoder(
                 options=encoder.get_codec_options(encoder_threads, as_strings=True),
             )
             stream.pix_fmt = encoder.pix_fmt
-            stream.width = 64
-            stream.height = 64
+            stream.width = probe_width
+            stream.height = probe_height
             stream.time_base = Fraction(1, fps)
 
-            frame = av.VideoFrame.from_ndarray(np.zeros((64, 64, 3), dtype=np.uint8), format="rgb24")
+            frame = av.VideoFrame.from_ndarray(
+                np.zeros((probe_height, probe_width, 3), dtype=np.uint8), format="rgb24"
+            )
             frame.pts = 0
             frame.time_base = Fraction(1, fps)
             for packet in stream.encode(frame):
@@ -306,7 +315,18 @@ def _record_loop_sleep(
     remaining_s = budget_s - loop_s
     if remaining_s > 0:
         precise_sleep(remaining_s)
-        return
+        # The old diagnostic returned immediately after sleep, hiding CPU
+        # scheduling stalls while encoder threads were running. Allow a small
+        # wakeup tolerance so ordinary sub-millisecond jitter stays quiet.
+        elapsed_s = time.perf_counter() - start_loop_t
+        if elapsed_s - budget_s <= max(0.002, budget_s * 0.1):
+            return
+        stage_timings = {
+            **stage_timings,
+            "sleep_overshoot_ms": max(0.0, elapsed_s - budget_s) * 1000,
+        }
+        loop_s = elapsed_s
+        remaining_s = budget_s - loop_s
 
     robot_name = (
         getattr(robot, "name", None) or getattr(type(robot), "__name__", "record")
